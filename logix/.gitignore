@@ -1,0 +1,7 @@
+# 构建产物与 trace 临时文件
+vliwsim_run
+*.o
+*.trace
+*.strings.json
+*.vsim
+__pycache__/
