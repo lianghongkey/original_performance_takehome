@@ -96,8 +96,12 @@ class KernelBuilder:
         - 批状态 idx/val 常驻 scratch；256 元素分成 ng=batch/VLEN 组，每组用独立寄存器
           （组间天然独立，供打包器填满每拍 valu 槽）。
         - hash 阶段 0/2/4 折成一条 multiply_add（val*k+c）；移位阶段各用 1 个临时。
-        - node_val 数据相关：低层用「线性 select」由广播的 forest 向量选出（免 gather），
-          其余层保持标量 gather；idx 存绝对地址免 gather 的地址加（pre-offset）。
+        - node_val 数据相关：低层用「pair 线性插值 + 系数 select」免 gather——相邻两节点的
+          node_val 对绝对地址 A 线性（nv = A*D + E，mod 2^32 恒等），pair 间 vselect 选系数、
+          末尾一条 MAC 出值；其余层保持标量 gather；idx 存绝对地址免 gather 的地址加（pre-offset）。
+        - load 的时间分布：最早两个 wavefront 组的 r1-3 select 换回 gather（EARLYW），填掉
+          「前 ~100 拍 wavefront 未到 gather 轮」的 load 空窗；head 常量隔一个走 flow add_imm
+          （CONSTFLOW，基于恒零 scratch 词），省 head 的 load 槽。
         - 四引擎均衡：瓶颈 valu 的活分流到闲置 alu（N_ALU 组标量化）与 flow
           —— idx 更新的「+c」加法搬到 flow 的 vselect（parity 在 CFP/CFP+1 间选，IDXFLOW 组）。
         - 发射顺序按对角错位 + round-major 末轮（EMIT=diagtail）消掉头尾 drain 空转。
@@ -109,18 +113,71 @@ class KernelBuilder:
         # ── scratch 区域 ──────────────────────────────────────────────
         # NV 复用作 gather 地址缓冲：addr=idx+forest_p 写进 NV，再 load(nv,nv) 就地读地址写值
         # （单 op 读旧写新合法），省掉独立 ADDR 区（256 words），给低层去重腾地方。
+        # nv/tmp 的组间配对共享（g 与 g+16 共用一份）：valu 组的起跑被 valu 饱和天然错开，
+        # g+16 的首轮要等公平份额的槽位、自然落在 g 的整链（~230 拍）结束之后，共享不产生
+        # 真实打包约束；alu 组不同——alu 引擎有余量，其早轮会冲到调度最前端、和任何组的
+        # 生存期都重叠，共享即串行化（sched_diff 实证）。故 SHAREPAIR=2 只配对 valu 组、
+        # alu 组保留私有。0=不共享；1=全部配对（已证毒 +45，留作对照）；2=仅 valu 组配对。
+        # 尾轮（round-major 的最后 TK 轮）另走独立小池：尾轮在程序序最末，配对槽会把早组的
+        # 尾轮锁到搭档组整个 body 之后（实测 +75 拍）；小池按 g%4 分槽、与各组尾轮的自然
+        # 阶梯（~116 拍/槽）对齐，无真实冲突。
+        NVMERGE = os.environ.get("NVMERGE", "0") == "1"
+        SHAREPAIR = int(os.environ.get("SHAREPAIR", "0"))
         IDX = self.alloc_scratch("idx", batch_size)
         VAL = self.alloc_scratch("val", batch_size)
-        NV = self.alloc_scratch("nv", batch_size)          # gather 地址/值 缓冲（就地）
-        TMP = self.alloc_scratch("tmp", batch_size)        # 每组一个临时向量
+        # （TMP/NV 工作区推迟到 alu 组划分确定后分配——槽位数取决于配对方式，见 alu_groups 处。）
+        # 共享短临时（L3/L4 系数 select 的 cond 等）：t2a 放短命的 cond，t2b 放 D-acc（仅合并
+        # 模式用）。槽位在 emit_gr 里按 g%4 + 前/后半程 bank 计算，避免早轮/晚轮共槽毒化 run-ahead。
+        TMP2A = self.alloc_scratch("tmp2a", VLEN * 8)
+        TMP2B = self.alloc_scratch("tmp2b", VLEN * 8) if NVMERGE else TMP2A
 
         ops = []
-        ops.append(("flow", ("pause",)))  # 起始 pause（对齐 reference 的第一个 yield）
+        # 两条 pause（对齐 reference 的两个 yield）不进 ops——打包器把屏障算子独占一拍，
+        # 首尾各浪费 1 拍。改为打包完成后直接注入 bundle（见文末）：pause 与同 bundle 其余
+        # 槽同拍执行、周期末才暂停，语义等价——run 边界的检查只读 inp_values，首个 pause
+        # 落在任何 store 之前、结束 pause 落在全部 store 之后即可。
 
         # 部分组的 hash/idx 走标量 ALU（12 槽/拍、原本闲置），把瓶颈 valu 的活分流过去：
         # 总吞吐 48 elem/拍(仅 valu) → 60(valu+alu)。N_ALU=6 由 roofline 扫参平衡两引擎得出
         # （alu 组均匀分散 + group-major 打包下实测最优）。env 可复扫调参。
         N_ALU = int(os.environ.get("N_ALU", "8"))
+        # alu 组划分提前到此（TMP/NV 槽位分配要用）：均匀撒到全 32 组，让 body 全程都给 alu
+        # 供活（trace 实证、扫参得最优）。注意不能用 (i*stride)%ng——N_ALU>8 时回绕重复、
+        # set 去重后实际组数缩水（此 bug 曾让 N_ALU=9/10 的扫参全部空转）。
+        if "ALU_STRIDE" in os.environ:
+            ALU_STRIDE = int(os.environ["ALU_STRIDE"])
+            alu_groups = set((i * ALU_STRIDE) % ng for i in range(N_ALU)) if N_ALU else set()
+        else:
+            # ALU_OFF：整体偏移。g0/g1 承担 EARLYW 的最早 gather，若 g0 是 alu 组（逐 lane
+            # hash 延迟 ~12 级 > 向量 8 级）会拖慢首批 gather 释放、加深 head 的 load 空窗。
+            ALU_OFF = int(os.environ.get("ALU_OFF", "0"))
+            alu_groups = ({(i * ng // N_ALU + ALU_OFF) % ng for i in range(N_ALU)}
+                          if N_ALU else set())
+
+        # TMP/NV 槽位表：alu 组恒私有；SHAREPAIR 下 g 与 g-ng/2 若都可共享则同槽
+        def _pairable(g):
+            return SHAREPAIR == 1 or (SHAREPAIR == 2 and g not in alu_groups)
+
+        _slot, _shared_slots, nslots = {}, set(), 0
+        _poolrank = {}   # 共享组在尾轮小池里的槽位（按共享组序号均衡，勿用 g%4——alu 组
+        for g in range(ng):  # 恰占满 g%4==0，会把 valu 组挤到 3 个槽上 8 深串行）
+            p = g - ng // 2
+            if SHAREPAIR and p >= 0 and _pairable(g) and _pairable(p):
+                _slot[g] = _slot[p]
+                _shared_slots.add(_slot[p])
+            else:
+                _slot[g] = nslots
+                nslots += 1
+        _npool = 0
+        for g in range(ng):
+            if _slot[g] in _shared_slots:
+                _poolrank[g] = _npool % 4
+                _npool += 1
+        TMP = self.alloc_scratch("tmp", nslots * VLEN)     # 每组一个临时向量（可配对共享）
+        NV = TMP if NVMERGE else self.alloc_scratch("nv", nslots * VLEN)   # gather/select 结果区
+        if SHAREPAIR:
+            TMPT = self.alloc_scratch("tmpt", VLEN * 4)    # 尾轮小池（见上）
+            NVT = self.alloc_scratch("nvt", VLEN * 4)
 
         def vop(ua, op, dest, a, b):
             """向量二元运算：ua=True 走 VLEN 条标量 alu，否则一条 valu。"""
@@ -145,13 +202,23 @@ class KernelBuilder:
         def scalar(name=None):
             return self.alloc_scratch(name)
 
-        # 本地常量池（scratch_const 写的是 self.instrs，会被 schedule(ops) 覆盖，故自建，按值去重）
+        # 本地常量池（scratch_const 写的是 self.instrs，会被 schedule(ops) 覆盖，故自建，按值去重）。
+        # CONSTFLOW：head 是 load-bound、flow 反而闲——把部分常量改走 flow 的 add_imm（基于一个
+        # 恒零的 scratch 词：scratch 初值全 0，从不写它），省下 head 的 load 槽给 vload/gather。
+        # 0=全走 load；1=隔一个走 flow（默认，实测最优）；2=全走 flow。
+        CONSTFLOW = int(os.environ.get("CONSTFLOW", "1"))
+        ZED = self.alloc_scratch("zed")          # 恒零（从不写入）
         _const_cache = {}
+        _cf_n = [0]
 
         def oconst(val):
             if val not in _const_cache:
                 a = scalar()
-                ops.append(("load", ("const", a, val)))
+                _cf_n[0] += 1
+                if CONSTFLOW == 2 or (CONSTFLOW == 1 and _cf_n[0] % 2 == 0):
+                    ops.append(("flow", ("add_imm", a, ZED, val)))
+                else:
+                    ops.append(("load", ("const", a, val)))
                 _const_cache[val] = a
             return _const_cache[val]
 
@@ -180,9 +247,8 @@ class KernelBuilder:
 
         # 从内存头部读运行期指针（不硬编码布局）：mem[4]=forest_values_p, mem[6]=inp_values_p
         def load_hdr(k):
-            sa, sv = scalar(), scalar()
-            ops.append(("load", ("const", sa, k)))
-            ops.append(("load", ("load", sv, sa)))
+            sv = scalar()
+            ops.append(("load", ("load", sv, oconst(k))))
             return sv
 
         fvp = load_hdr(4)   # forest_values_p
@@ -193,10 +259,8 @@ class KernelBuilder:
 
         def bvec(val):
             if val not in bcache:
-                sa = scalar()
                 vb = self.alloc_scratch(None, VLEN)
-                ops.append(("load", ("const", sa, val)))
-                ops.append(("valu", ("vbroadcast", vb, sa)))
+                ops.append(("valu", ("vbroadcast", vb, oconst(val))))
                 bcache[val] = vb
             return bcache[val]
 
@@ -209,7 +273,10 @@ class KernelBuilder:
         K0, C0 = bvec(4097), bvec(0x7ED55D16)      # 阶段0
         S19, C1 = bvec(19), bvec(0xC761C23C)        # 阶段1
         K2, C2C3 = bvec(33), bvec(0xE9F8CC1D)       # 阶段2：常量 = C2 + C3（0x165667B1+0xD3A2646C）
-        U512, UADD = bvec(512), bvec(0xBB372800)    # 阶段3：b<<9 = MAC(b',512,UADD)，UADD = -(C3×512) mod 2³²
+        # 阶段3 的 u 不再读阶段2 的输出、直接由阶段1 输出 v 算：u = (v·33+C2C3)·512 − C3·512
+        #   = v·16896 + C2·512 —— 两条 MAC 同读 v、并行发射，hash 关键链 9 级 → 8 级
+        # （终链 −1 拍；头部各组爬坡每轮 −1 拍 → 首批 gather 提早 ~4 拍，缩 load 前窗）。
+        K3P, C2X = bvec(16896), bvec((0x165667B1 * 512) % 2**32)
         K4, C4 = bvec(9), bvec(0xFD7046C5)          # 阶段4
         S16, C5 = bvec(16), bvec(0xB55A4F09)        # 阶段5
         ONE = bvec(1)
@@ -227,10 +294,8 @@ class KernelBuilder:
                 rcache[j] = vb
             return rcache[j]
 
-        one_s = scalar()
         cfp_s = scalar()
-        ops.append(("load", ("const", one_s, 1)))
-        ops.append(("alu", ("-", cfp_s, one_s, fvp)))       # CFP = 1 - forest_p (mod 2^32)
+        ops.append(("alu", ("-", cfp_s, oconst(1), fvp)))   # CFP = 1 - forest_p (mod 2^32)
         CFP = self.alloc_scratch("cfp_vec", VLEN)
         ops.append(("valu", ("vbroadcast", CFP, cfp_s)))
         # CFP+1 向量：idx 更新的 +c 用 vselect(parity, CFP+1, CFP) 走 flow 引擎（省 valu/alu）
@@ -264,10 +329,56 @@ class KernelBuilder:
         marginal_level = dedup_levels[-1] if dedup_levels else -1  # 最高去重层，部分 select
         L3SEL = int(os.environ.get("L3SEL", str(ng)))              # 边际层多少组走 select（其余 gather）
 
+        # L4 选择性去重（r=4/r=15）与早期 gather 换位的旋钮（见下），影响 fpp/FV_raw 的覆盖范围
+        SEL15 = int(os.environ.get("SEL15", "5"))    # 末轮改 MAC-select 的组数（alu 组，死区广播）
+        SEL4G = int(os.environ.get("SEL4G", "0"))    # r=4 改 select 的组数（死区广播方案下禁用）
+        EARLYW = int(os.environ.get("EARLYW", "8"))  # 早于此 wavefront 的 r1-3 select 改回 gather
+        EARLY1G = int(os.environ.get("EARLY1G", "0"))  # 前多少组只把 r1 改回 gather（填最深空窗）
+        # 末组从第几轮起 L2/L3 改 gather 缩 drain（默认倒数第 2 轮起——终链上 load 已空闲）
+        TAILG = int(os.environ.get("TAILG", str(max(rounds - 2, 2))))
+        TAILGN = int(os.environ.get("TAILGN", "1"))        # 末几组适用 TAILG
+        L4MAC = os.environ.get("L4MAC", "1") == "1"        # L4 select 用 MAC 链（0=flow 链）
+        # 末 TAILB 组的 idx 更新改 B 形式：B=2A+CFP 只读 idx、可在本轮 hash 期间提前算（借宿
+        # xor 之后即空闲的 nv），把 val→gather 的侧链从「&→+c→MAC」3 拍缩成「&→add」2 拍。
+        # valu 算子数不变（MAC+&+add）、纯时序重排——只对终链上的末尾组有意义（中段被吞吐掩盖）。
+        TAILB = int(os.environ.get("TAILB", "2"))
+        # 死区广播方案需要 ≥8 个 valu 组当 donor
+        use_l4 = (SEL15 > 0 and forest_height >= 4 and rounds >= 5
+                  and ng - len(alu_groups) >= 8)
+
+        # 双子预取（spec-gather）：gather 地址只有两个候选 2A+CFP+{0,1}——上一轮 idx 一出就把
+        # 两个孩子都 gather 回来（不等 parity），parity 出来后 1 条 vselect 选值+1 条选 idx。
+        # 代价 +8 载入/轮，收益：该轮关键路径里的 gather 段（~5 拍）完全挪出、且这些载入正好
+        # 填 head 的 load 空窗（前 ~100 拍 load 半闲：wavefront 还没推进到 gather 轮）。
+        # 只给最前排的 SPECG 组、从 r=4 起 SPECR 个纯 gather 轮用。
+        SPECG = int(os.environ.get("SPECG", "0"))
+        SPECR = int(os.environ.get("SPECR", "0"))
+        # SPEC15G：末尾几组的最后一轮（r15，L4 gather）也走双子预取——r14 的 hash 还没算完就把
+        # r15 的两个候选孩子取回来（此时 load 已开始收尾空闲），砍掉收尾关键链里的 gather 段。
+        SPEC15G = int(os.environ.get("SPEC15G", "0"))
+        nspec_slots = SPECG + SPEC15G
+        NV2 = self.alloc_scratch("nv2", VLEN * nspec_slots) if nspec_slots else 0
+
+        def spec_slot(g):
+            return NV2 + (g if g < SPECG else SPECG + (ng - 1 - g)) * VLEN
+
+        def is_spec(g, rr):
+            if (rr % period) < 4 or forest_height < 4:
+                return False
+            if g < SPECG and 4 <= rr < min(4 + SPECR, forest_height + 1) and rr < rounds - 1:
+                return True
+            return rr == rounds - 1 and g >= ng - SPEC15G
+
+        _spec_pending = {}   # g -> 双子预取的 16 条 load：延迟到该组下一轮排放点再发——
+                             # 若在本轮（r14 的 idx 段）排放，会在 load 队列里插到所有组的
+                             # r15 gather 前面、把别人挤后 ~4 拍（依赖上它们本就更早就绪，
+                             # 放到队尾照样按依赖时刻被回填）。
+
         # 共享地址标量 fpp[k] = forest_p + k（k 覆盖去重层所有节点号及 rvec 用到的 j）：一次 prefix
         # 生成、rvec 与 Fvec 共用，把原本 ~28 条散在 head 的 flow add_imm 全消掉（trace-driven）。
         nmax = ((1 << (max(dedup_levels) + 1)) - 1) if dedup_levels else 3
-        fpp = seq(fvp, max(3, nmax), 1)          # fpp[0]=fvp
+        nfpp = max(nmax, 30) if use_l4 else nmax  # L4 另需 fpp[15..29]（E 系数与 rvec 的地址标量）
+        fpp = seq(fvp, max(3, nfpp), 1)          # fpp[0]=fvp
 
         # Fvec 节点值：去重层的节点号是连续区间 0..nmax-1 → 用 vload 成块取 forest（每条 8 个），
         # 再从块里逐节点 broadcast——把原本 nmax 条散 load 压成 ⌈nmax/8⌉ 条 vload（head 是 load-bound，
@@ -277,87 +388,371 @@ class KernelBuilder:
         for c in range(nchunk):
             ops.append(("load", ("vload", FV_raw + c * VLEN, fpp[c * VLEN])))
 
-        Fvec = {}  # 节点号 k -> 该节点 forest 值的广播向量地址
-        for L in dedup_levels:
+        # L0 仍用 F0 的广播向量（单节点直接当 node_val 用）。
+        F0 = self.alloc_scratch("fnode0", VLEN)
+        ops.append(("valu", ("vbroadcast", F0, FV_raw + 0)))
+
+        # L0FOLD：r11 的 node_val 是常量 F0（L0 单节点），且 xor 满足结合律——把 val^=F0 折进
+        # r10 hash 阶段5 的常量 xor：(v^C5)^(v>>16)^F0 = (v^(C5^F0))^(v>>16)。r10 用 C5F0 向量、
+        # r11 跳过 nv-xor：省 32 组·轮 × 1 算子（valu −24 / alu −64），每组 r10→r11 链还短 1 级。
+        # （r0 不可折：初值来自 vload，前面没有可寄生的 hash 级。）
+        L0FOLD = os.environ.get("L0FOLD", "1") == "1" and rounds > period
+        if L0FOLD:
+            c5f0_s = scalar("c5f0")
+            ops.append(("alu", ("^", c5f0_s, FV_raw + 0, oconst(0xB55A4F09))))
+            C5F0 = self.alloc_scratch("c5f0_vec", VLEN)
+            ops.append(("valu", ("vbroadcast", C5F0, c5f0_s)))
+
+        # L1SEL：L1 轮（r1/r12）的 node_val 不再用 pair-MAC——上一轮是 L0 轮，其 idx 更新的
+        # parity 恰好是 L1 的节点选择位、且是 tmp 的最后一笔写（本轮 select 又先于一切 tmp 写），
+        # 一条 flow vselect(parity, F2, F1) 直接选值：每组每 L1 轮省 1 条 valu MAC（共 −64 槽，
+        # valu 是瓶颈），代价 +1 flow（flow 有大量余量）。F1/F2 是运行期 forest 值，从 FV_raw 广播。
+        L1SEL = os.environ.get("L1SEL", "1") == "1"
+        if L1SEL:
+            F1V = self.alloc_scratch("fnode1", VLEN)
+            F2V = self.alloc_scratch("fnode2", VLEN)
+            ops.append(("valu", ("vbroadcast", F1V, FV_raw + 1)))
+            ops.append(("valu", ("vbroadcast", F2V, FV_raw + 2)))
+
+        # 线性插值系数（pair-MAC）：相邻两节点 (F[k], F[k+1])，node_val 是绝对地址 A 的线性函数
+        #   nv = A*D + E，D = F[k+1]-F[k]，E = F[k] - (forest_p+k)*D   （mod 2^32 恒等，A∈{fp+k,fp+k+1}）
+        # setup 时用 head 里空闲的 alu 算出 D/E 标量再广播。运行期一条 MAC 顶掉「cmp+vselect」——
+        # L1 整层 1 MAC；L2/L3/L4 先用 vselect 选出 D/E 系数向量再 1 MAC（cmp 数从 2^L-1 砍到
+        # 2^(L-1)-1）。每 group-round：L1 省 1 flow；L2 省 1 valu+1 flow；L3 省 3 valu+1 flow
+        # （alu 组另省大量标量 cmp）。
+        pair_DE = {}   # (level, j) -> (Dvec, Evec)，pair j 覆盖节点 {base+2j, base+2j+1}
+        # d/m/e 中间标量用 2 组轮转缓冲（15 对 × 3 → 6 词）：只在 setup 期活跃，轮转引入的
+        # WAW 间隔 2 对（~6 条 alu），setup 的 alu 本就有余量，不构成约束。
+        _dme = [(scalar(), scalar(), scalar()) for _ in range(2)]
+        _dme_n = [0]
+
+        def setup_pairs(L, raw_off):
+            """给第 L 层建 pair 系数向量；raw_off = 该层 base 节点在 FV_raw 里的偏移。"""
             base = (1 << L) - 1
-            for k in range(base, base + (1 << L)):
-                if k in Fvec:
-                    continue
-                fv = self.alloc_scratch(f"fnode{k}", VLEN)
-                ops.append(("valu", ("vbroadcast", fv, FV_raw + k)))   # forest[k] 来自上面的块 vload
-                Fvec[k] = fv
+            for j in range(1 << (L - 1)):
+                k = base + 2 * j
+                d_s, m_s, e_s = _dme[_dme_n[0] % 2]
+                _dme_n[0] += 1
+                ops.append(("alu", ("-", d_s, FV_raw + (k - raw_off) + 1, FV_raw + (k - raw_off))))
+                ops.append(("alu", ("*", m_s, fpp[k], d_s)))
+                ops.append(("alu", ("-", e_s, FV_raw + (k - raw_off), m_s)))
+                Dv = self.alloc_scratch(f"pD{k}", VLEN)
+                Ev = self.alloc_scratch(f"pE{k}", VLEN)
+                ops.append(("valu", ("vbroadcast", Dv, d_s)))
+                ops.append(("valu", ("vbroadcast", Ev, e_s)))
+                pair_DE[(L, j)] = (Dv, Ev)
+
+        for L in dedup_levels:
+            if L >= 2 or (L == 1 and not L1SEL):   # L1SEL 下 L1 不需要 pair 系数（直接 vselect 值）
+                setup_pairs(L, 0)
+
+        # L2 的 Δ 系数向量（末尾组 r13 用 MAC 链版 L2 select：cmp/P0/Q 三者并行 + 1 条 acc-MAC
+        # = 2 级，比通用版 cmp→Dsel→Esel→MAC 的 4 级短——两个 vselect 在单槽 flow 上必然串行）。
+        TAILM = int(os.environ.get("TAILM", "0"))
+        if TAILM and 2 in set(dedup_levels):
+            # dd/ee 借旋转缓冲存（只需活到紧随的 broadcast，程序序保证 L4 块的复写在其后）
+            dd_s, ee_s = _dme[1][0], _dme[1][1]
+            # ΔD = (F6−F5) − (F4−F3)；ΔE = E1 − E0（由 FV_raw 与 fpp 重算，setup alu 便宜）
+            m1, m2, m3 = _dme[0]
+            ops.append(("alu", ("-", m1, FV_raw + 6, FV_raw + 5)))
+            ops.append(("alu", ("-", m2, FV_raw + 4, FV_raw + 3)))
+            ops.append(("alu", ("-", dd_s, m1, m2)))
+            ops.append(("alu", ("*", m1, fpp[5], m1)))       # (fp+5)·D1
+            ops.append(("alu", ("*", m2, fpp[3], m2)))       # (fp+3)·D0
+            ops.append(("alu", ("-", m3, FV_raw + 5, m1)))   # E1
+            ops.append(("alu", ("-", m1, FV_raw + 3, m2)))   # E0
+            ops.append(("alu", ("-", ee_s, m3, m1)))
+            L2DD = self.alloc_scratch("l2ddv", VLEN)
+            L2EE = self.alloc_scratch("l2eev", VLEN)
+            ops.append(("valu", ("vbroadcast", L2DD, dd_s)))
+            ops.append(("valu", ("vbroadcast", L2EE, ee_s)))
+            # 专属 cond 向量：绝不能用共享 t2a——末组的 r13 执行极晚（~b1040）而程序序在尾段
+            # 之前，共槽会把所有同槽组的尾段 r14 WAW 锁到它后面（实测 +48）。
+            TAILMC = self.alloc_scratch("tailmc", VLEN)
+
+        # L4（16 节点）选择性去重（SEL15）：把部分 alu 组的 r15 gather 换成 select——load 流从
+        # ~b100 起全程饱和，从流里任何位置减 8 载入都让 load 终点提前 4 拍；换出的 select 算力
+        # （cmp 走 alu、vselect 走 flow、MAC 走 valu）恰好落在尾部的空闲引擎上。
+        # scratch 装不下 8 对系数向量（128 词）→ **死区广播**：setup 只算 16 个 D/E 标量（16 词），
+        # 系数「向量」借用 8 个 donor 组（valu 组，其 r15 先排放完毕）已死的 tmp/nv 区，在尾部
+        # r15 序列中段注入 vbroadcast 现场生成；被转换组的 r15 排放在广播之后，整段浮到尾部的
+        # 空闲拍里执行。程序序保证语义：donor 全部用完 → 广播写 → 转换组读。
+        # 系数存 Δ 形式（供 MAC 链条 select）：nv = (A·D0+E0) + Σⱼ cⱼ·(A·ΔDⱼ+ΔEⱼ)，
+        # cⱼ = (A ≥ fp+15+2j) 是阶梯条件——选中 pair p 时恰好前 p 个 cⱼ=1，累加出 A·Dₚ+Eₚ。
+        # MAC 链条全程 0 条 flow（尾部 flow 是墙、valu 反而大量空闲——select 形式要长成尾部的形状）。
+        l4de = []   # [(D0,E0), (ΔD1,ΔE1), ..., (ΔD7,ΔE7)] 持久标量，活到尾部广播
+        if use_l4:
+            for c in range(2):
+                ops.append(("load", ("vload", FV_raw + c * VLEN, fpp[15 + c * VLEN])))
+            pd, pe = None, None   # 上一对的 d/e（rotor，供 Δ 相减）
+            for j in range(8):
+                k = 15 + 2 * j
+                d_r, m_r, e_r = _dme[j % 2]           # 2 路 rotor：算 Δ 时上一对仍在
+                ops.append(("alu", ("-", d_r, FV_raw + (k - 15) + 1, FV_raw + (k - 15))))
+                ops.append(("alu", ("*", m_r, fpp[k], d_r)))
+                ops.append(("alu", ("-", e_r, FV_raw + (k - 15), m_r)))
+                ds, es = scalar(f"l4d{j}"), scalar(f"l4e{j}")
+                if j == 0 or not L4MAC:
+                    ops.append(("alu", ("+", ds, d_r, ZED)))      # 复制 Dⱼ/Eⱼ（ZED 恒 0）
+                    ops.append(("alu", ("+", es, e_r, ZED)))
+                else:
+                    ops.append(("alu", ("-", ds, d_r, pd)))       # ΔDⱼ = Dⱼ − Dⱼ₋₁
+                    ops.append(("alu", ("-", es, e_r, pe)))
+                pd, pe = d_r, e_r
+                l4de.append((ds, es))
+            # donor：前 8 个 valu 组（与被转换的 alu 组天然不相交）。其 tmp/nv 在自身 r15 排放
+            # 完毕后永久死亡，正好当 L4 系数向量的容身处。L4Q2=1 时再多征 4 个 donor 给被转换组
+            # 当第二 Q 缓冲（实测收益被额外 donor 的死亡门槛抵消，默认关）。
+            L4Q2 = os.environ.get("L4Q2", "0") == "1"
+            _donors = [g for g in range(ng) if g not in alu_groups][:12 if L4Q2 else 8]
+            for j in range(8):
+                dg = _donors[j]
+                pair_DE[(4, j)] = (TMP + _slot[dg] * VLEN, NV + _slot[dg] * VLEN)
+            _q2 = []
+            for dg in _donors[8:]:
+                _q2 += [TMP + _slot[dg] * VLEN, NV + _slot[dg] * VLEN]
 
         dedup_set = set(dedup_levels)
 
-        def emit_node_select(ua, level, nv, tmp, idx):
-            """线性 select 出 forest[idx]（idx 在第 level 层）。返回存放 node_val 的地址。"""
+        def cmp_gt(ua, dest, j, idx):
+            """dest = (forest_p + j < A)。alu 组走 8 条标量、阈值直接用标量 fpp[j]
+            （标量比较不需要广播向量——L4 的 7 个 rvec 全省掉）；valu 组用 rvec(j)。"""
+            if ua:
+                for l in range(VLEN):
+                    ops.append(("alu", ("<", dest + l, fpp[j], idx + l)))
+            else:
+                ops.append(("valu", ("<", dest, rvec(j), idx)))
+
+        def emit_node_select(ua, level, nv, tmp, t2a, t2b, idx):
+            """选出 forest[idx]（idx 在第 level 层，存绝对地址 A），结果放 nv。
+
+            pair 线性插值 + 系数 select：先在 2^(L-1) 个 pair 间线性 select 出系数 D/E（cond 是
+            「A ≥ fp+base+2j」⟺ rvec(base+2j-1) < A，cmp 走 valu/alu、vselect 走 flow），最后
+            nv = A*D_sel + E_sel 一条 MAC。L3/L4 的 cond/D-acc/E-acc 需三个活跃向量：cond 恒用
+            共享 t2a；合并模式（nv==tmp）下 D-acc 用共享 t2b，否则用私有 nv。"""
             base = (1 << level) - 1
-            cnt = 1 << level
-            if cnt == 1:
-                return Fvec[base]                                   # L0：单节点，直接用其向量
-            # idx 存的是绝对地址 A；逻辑比较 (idx_logical>=k) ⟺ A > forest_p+(k-1) ⟺ rvec(k-1)<A
-            # 比较：alu 组走 alu、valu 组走 valu；vselect 走很闲的 flow。（试过把部分 valu 组的比较
-            # 分流到 alu 来平衡——alu比较→flow选→valu哈希 跨引擎伤打包，反更差，不做。）
-            vop(ua, "<", tmp, rvec(base), idx)                    # A > forest_p+base（即 idx>=base+1）
-            ops.append(("flow", ("vselect", nv, tmp, Fvec[base + 1], Fvec[base])))
-            for k in range(base + 2, base + cnt):
-                vop(ua, "<", tmp, rvec(k - 1), idx)               # A > forest_p+(k-1)（即 idx>=k）
-                ops.append(("flow", ("vselect", nv, tmp, Fvec[k], nv)))
+            if level == 0:
+                return F0                                        # L0：单节点，直接用其向量
+            if level == 1:
+                if L1SEL:
+                    # 上一轮（L0）的 parity 还活在 tmp（其 idx 更新的最后一笔 tmp 写、本轮
+                    # select 先于一切 tmp 写）——一条 flow vselect 直接选 F1/F2，省 1 valu
+                    ops.append(("flow", ("vselect", nv, tmp, F2V, F1V)))
+                else:
+                    vmac(ua, nv, idx, *pair_DE[(1, 0)])          # 1 MAC 顶掉 cmp+vselect
+                return nv
+            if level == 2:
+                D0, E0 = pair_DE[(2, 0)]
+                D1, E1 = pair_DE[(2, 1)]
+                ca = t2a if NVMERGE else tmp                     # cond（非合并时用私有 tmp）
+                cmp_gt(ua, ca, base + 1, idx)                    # A ≥ fp+base+2
+                ops.append(("flow", ("vselect", nv, ca, D1, D0)))
+                ops.append(("flow", ("vselect", ca, ca, E1, E0)))   # 读旧 ca(cond) 写新，同拍合法
+                vmac(ua, nv, idx, nv, ca)                        # nv = A*D_sel + E_sel
+                return nv
+            # level ≥ 3：2^(L-1) 个 pair 的线性系数 select（n-1 cmp + 2(n-1) vselect + 1 MAC）
+            npair = 1 << (level - 1)
+            dacc = t2b if NVMERGE else nv                        # D-acc；E-acc 恒在私有 tmp
+            D0, E0 = pair_DE[(level, 0)]
+            D1, E1 = pair_DE[(level, 1)]
+            cmp_gt(ua, t2a, base + 1, idx)
+            ops.append(("flow", ("vselect", dacc, t2a, D1, D0)))
+            ops.append(("flow", ("vselect", tmp, t2a, E1, E0)))
+            for j in range(2, npair):
+                Dj, Ej = pair_DE[(level, j)]
+                cmp_gt(ua, t2a, base + 2 * j - 1, idx)           # A ≥ fp+base+2j
+                ops.append(("flow", ("vselect", dacc, t2a, Dj, dacc)))
+                ops.append(("flow", ("vselect", tmp, t2a, Ej, tmp)))
+            vmac(ua, nv, idx, dacc, tmp)                         # nv = A*D_sel + E_sel
+            return nv
+
+        def emit_l4_macsel(ua, nv, tmp, t2a, idx, q2):
+            """L4（16 节点）的 MAC 链条 select：nv = (A·D0+E0) + Σⱼ cⱼ·(A·ΔDⱼ+ΔEⱼ)。
+            0 条 flow（尾部 flow 是墙）；15 MAC 走 valu（尾部 valu 空闲）、7 个阶梯 cmp 走
+            alu（仅 alu 组转换，阈值用标量 fpp）。acc=nv、cond=t2a；Qⱼ 在 tmp 与 q2（另一块
+            死区）间交替，免得共用一个缓冲被 WAW 串成 2 拍/级。"""
+            D0v, E0v = pair_DE[(4, 0)]
+            vmac(ua, nv, idx, D0v, E0v)                          # acc = A·D0 + E0
+            for j in range(1, 8):
+                Qd, Qe = pair_DE[(4, j)]                         # Δ 系数向量（死区广播）
+                qb = tmp if j % 2 else q2
+                vmac(ua, qb, idx, Qd, Qe)                        # Qⱼ = A·ΔDⱼ + ΔEⱼ
+                cmp_gt(ua, t2a, 14 + 2 * j, idx)                 # cⱼ = (A ≥ fp+15+2j)
+                vmac(ua, nv, t2a, qb, nv)                        # acc += cⱼ·Qⱼ
             return nv
 
         # ── 主循环 ────────────────────────────────────────────────────
         # 按「组外层、轮内层」发射（group-major）：批内各组独立，交给打包器后不同组会
         # 错位在不同层——组 A 在低层吃 valu 时组 B 在高层吃 load，两引擎同时忙，消掉
         # round-major 下「所有组同步在低层→load 空转」的硬停顿。算子与依赖不变，正确性照旧。
-        # alu 组按 stride-2 铺开（整组标量化，链留同一引擎、打包好；散点会跨引擎卡顿）。
-        # stride-2 布局 + 下面 L0 idx 特判由扫参得到实测最优。
-        # alu 组按 ALU_STRIDE 铺开：S3 折叠后 alu 负担降、需把 alu 组更均匀撒到全 32 组（stride-4 而非 2，
-        # 覆盖 0..28）以在整段 body 都给 alu 供活、不至于中后段 alu 空转（trace 实证、扫参得最优）。
-        ALU_STRIDE = int(os.environ.get("ALU_STRIDE", "4"))
-        alu_groups = set((i * ALU_STRIDE) % ng for i in range(N_ALU)) if N_ALU else set()
+        # alu 组按 stride 铺开（整组标量化，链留同一引擎、打包好；散点会跨引擎卡顿）——
+        # 划分已提前到 N_ALU 处（TMP/NV 槽位分配要用）。
         # 分数级平衡：再挑 1 个「半 alu 组」，其前 EXTRA 轮走 alu、其余走 valu（连续块，只 1 次
         # 跨引擎转换，避散点 lane-sync）——把 valu/alu 之间那点余量磨平（整组太粗）。
         EXTRA = int(os.environ.get("EXTRA", "0"))
         xg = next((g for g in range(ng) if g not in alu_groups), -1)
+        # 前 AE 轮所有组一律走 alu：头部所有组的早轮挤在一起把 valu 打满、gather 迟迟起不来
+        # （load 空窗的根源），把最前面几轮的非-MAC 挪到头部尚有余量的 alu，让前端更快推进；
+        # 每组只在 r=AE 处跨引擎交接一次。
+        AE = int(os.environ.get("AE", "0"))
 
         # idx 更新的 +c 加法搬到 flow 引擎（vselect 在 parity 上选 CFP/CFP+1）：flow 平时很闲
         # （~55% 占用），把它填满能同时卸 valu 与 alu 的负担。优先给 valu 组（alu 组搬 flow 会拉出
         # alu→flow→valu 的跨引擎链、且 flow 单槽突发，反伤打包，实测更差）。IDXFLOW=用 flow 的组数。
-        IDXFLOW = int(os.environ.get("IDXFLOW", "20"))
+        IDXFLOW = int(os.environ.get("IDXFLOW", "22"))
         _forder = [g for g in range(ng) if g not in alu_groups] + \
                   [g for g in range(ng) if g in alu_groups]
         idxflow_groups = set(_forder[:IDXFLOW])
 
+        # 发射顺序参数（emit_gr 里 EARLYW 要用 wavefront 位置，提前解析）
+        EMIT = os.environ.get("EMIT", "diagtail")
+        SK = int(os.environ.get("SKEW", "4"))
+        TK = int(os.environ.get("TAILK", "2"))
+
+        # L4 select 的目标组选择：
+        # r15：从倒数第 3 组起**降序**选（tail 解剖：终段 b1089-1100 是末 3 组 r15 gather 以 2/拍
+        #   串行占满 load——把倒数 3、4 组的 r15 改 select 直接腾出终段 load 槽；最后 2 组除外，
+        #   其 r15 在收尾关键路径上，select 的串行链反而加 drain 延迟）；
+        # r4：排除最前 4 组（其 r4 gather 是 head load 空窗的天然填充物），alu 组优先。
+        # 死区广播方案下只允许 alu 组转换（cmp 用标量 fpp 阈值、不需要 rvec 向量），且 r4 转换
+        # 不可用（系数向量到尾部才广播出来，body 期读不到）。
+        _c15 = sorted(alu_groups)
+        sel15_groups = set(_c15[:SEL15])
+        sel4_groups = set()
+        # SEL15A：再转换若干 **valu 组**的 r15 为「纯 ALU 逐 lane MAC 链」——valu 形式受
+        # 「系数广播须等 valu 尾部饱和解除」的墙限制（SEL15>7 堆叠的根因）；纯 ALU 形式
+        # 直接用 setup 期已就绪的 l4de 标量（乘/加/比较逐 lane 走 alu，无广播、无死区依赖、
+        # 零 valu）。每组代价 +296 alu（尾部 alu 空闲 30-50%）、收益 −8 load（流末端 −4 拍）。
+        # cond 缓冲借 setup 后死亡的 fvraw（4 槽）+ 尾部空闲 scratch，与 t2a 无冲突。
+        SEL15A = int(os.environ.get("SEL15A", "3"))
+        _l4donors = set(_donors) if use_l4 else set()   # 死区系数宿主，绝不可被转换（会踩系数区）
+        _a15_cands = [g for g in range(ng)
+                      if g not in alu_groups and g not in _l4donors
+                      and g >= 11 and g < ng - 2]
+        sel15a_groups = set(_a15_cands[:SEL15A]) if use_l4 else set()
+        # SEL4A：r=4 的 gather 也用纯 ALU 形式转 select——body 期系数标量已就绪（valu 形式
+        # 才受死区广播限制）。候选组挑 r4 执行时刻落在 body alu 低谷（trace：b~450/b~650
+        # ↔ g≈13/g≈20）的 valu 组；每组 −8 load / +296 alu（落在低谷则不顶 alu frontier）。
+        SEL4A = int(os.environ.get("SEL4A", "1"))
+        _a4_cands = [g for g in [21, 13, 22, 19, 23, 18, 14, 17, 15, 11]
+                     if g not in alu_groups and g not in _l4donors]
+        sel4a_groups = set(_a4_cands[:SEL4A]) if use_l4 else set()
+        _a15_rank = {g: i for i, g in enumerate(sorted(sel15a_groups | sel4a_groups))}
+        _a15_cond = [FV_raw + c * VLEN for c in range(nchunk)]  # fvraw：setup 后死区
+        # 再补几个专属 cond 槽（预留 6*VLEN 给 emit 期才惰性分配的 rvec(1,2,4,8,11,13)）
+        while ((sel15a_groups or sel4a_groups) and len(_a15_cond) < 8
+               and self.scratch_ptr + 7 * VLEN <= SCRATCH_SIZE):
+            _a15_cond.append(self.alloc_scratch(None, VLEN))
+        # 被转换组的 cond 槽位按「转换组序号」分——alu 组全是 g%4==0，若沿用 g%4+bank 的槽位，
+        # 所有转换组的 42 个 cond 写会挤在同一个 t2a 槽上跨组串行（实测 SEL15=6 时尾部 +20）。
+        # 尾部时刻 t2a 的 8 个槽全已死亡（bank0 的 L2/L3 cond 在 body 用完），可全用。
+        _sel15_rank = {g: i for i, g in enumerate(_c15)}
+
         def emit_gr(g, r):
                 b = g * VLEN
-                idx, val, nv, tmp = IDX + b, VAL + b, NV + b, TMP + b
-                ua = (g in alu_groups) or (g == xg and r < EXTRA)  # 该(组,轮)走标量 alu
+                bp = _slot[g] * VLEN                              # nv/tmp 槽位（valu 组配对共享）
+                idx, val, tmp, nv = IDX + b, VAL + b, TMP + bp, NV + bp
+                if (SHAREPAIR and _slot[g] in _shared_slots
+                        and EMIT == "diagtail" and r >= rounds - TK):
+                    tmp = TMPT + _poolrank[g] * VLEN              # 共享组的尾轮走独立小池（见上）
+                    nv = NVT + _poolrank[g] * VLEN
+                # 共享临时槽位 = g%4 + 前后半程 bank：若「某组的晚轮」与「另一组的早轮」共槽，
+                # 程序序（wavefront 序）会把晚轮排前面，逼后者放弃跑前（run-ahead）、等 ~150 拍
+                # （diffsched 实证的 WAR 毒化）。按轮次分 bank 后共槽的只会是同期轮，天然错开。
+                t2s = (g % 4 + (4 if r >= rounds // 2 else 0)) * VLEN
+                t2a = TMP2A + t2s
+                t2b = TMP2B + t2s
+                ua = (g in alu_groups) or (g == xg and r < EXTRA) or r < AE  # 该(组,轮)走标量 alu
                 level = r % period
-                # node_val：去重层用线性 select，其余标量 gather。
-                # 边际层（最高去重层）只对部分组 select、其余 gather——用 load 余量换 compute
-                # 减负，让 load≈compute 平衡（L3SEL 控制多少组 select）。
-                # （试过让 alu 组在边际层改走 gather 卸 alu：gather 给 alu 组的链加 load 延迟、且
-                #  tail 那轮聚集突发 load，打包反变差 1143→1150+，故不做——alu/valu 已在最优平衡点。）
+                # node_val：去重层用线性 select，其余标量 gather。三处按「load 的时间分布」微调
+                # （load 总量与 valu 双双压 roofline 后，赢面在把 load 的活从尾部搬到头部空窗）：
+                # ① 边际层 L3 部分组 select（L3SEL）；② 早期 wavefront 的 r1-3 反而改回 gather
+                #    （EARLYW——头 100 拍 wavefront 未到 gather 轮、load 空转，select 在此纯浪费）；
+                # ③ r=15/r=4（L4 层）部分组改 select（SEL15/SEL4G），卸掉 load 尾部堆积。
                 sel = (level in dedup_set) and (level < marginal_level or g < L3SEL)
-                if sel:
-                    nv_src = emit_node_select(ua, level, nv, tmp, idx)
+                if sel and EMIT == "diagtail" and 1 <= r <= 3 and (r + SK * g) < EARLYW:
+                    sel = False
+                if sel and r == 1 and g < EARLY1G:
+                    sel = False   # r1 的 gather 发得最早（~b16），专门填 head 空窗最深处
+                if sel and g >= ng - TAILGN and level in (2, 3) and r >= TAILG:
+                    sel = False   # 末组的晚轮 select 改 gather：终链上 load 早已空闲，
+                                  # gather 2 级比系数 select 4 级短，直接缩 drain
+                if use_l4 and level == 4 and (
+                    (r == rounds - 1 and g in (sel15_groups | sel15a_groups))
+                    or (r == 4 and g in (sel4_groups | sel4a_groups))
+                ):
+                    sel = True
+                if is_spec(g, r):
+                    # 双子预取的 16 条 load 在此排放（程序序须先于下面读值的 vselect），
+                    # parity 仍留在 tmp：一条 vselect 选出 node_val
+                    ops.extend(_spec_pending.pop(g, []))
+                    ops.append(("flow", ("vselect", nv, tmp, spec_slot(g), nv)))
+                    nv_src = nv
+                elif sel and level == 4 and (
+                        (r == rounds - 1 and g in sel15a_groups)
+                        or (r == 4 and g in sel4a_groups)):
+                    # 纯 ALU 逐 lane MAC 链（见 SEL15A）：acc=nv、Q=tmp、cond 用死区槽；
+                    # 系数/阈值全是标量（l4de/fpp），不经广播、不占 valu。
+                    ca = _a15_cond[_a15_rank[g] % len(_a15_cond)]
+                    d0, e0 = l4de[0]
+                    for l in range(VLEN):
+                        ops.append(("alu", ("*", nv + l, idx + l, d0)))
+                        ops.append(("alu", ("+", nv + l, nv + l, e0)))
+                    for j in range(1, 8):
+                        dj, ej = l4de[j]
+                        for l in range(VLEN):
+                            ops.append(("alu", ("<", ca + l, fpp[14 + 2 * j], idx + l)))
+                            ops.append(("alu", ("*", tmp + l, idx + l, dj)))
+                            ops.append(("alu", ("+", tmp + l, tmp + l, ej)))
+                            ops.append(("alu", ("*", tmp + l, tmp + l, ca + l)))
+                            ops.append(("alu", ("+", nv + l, nv + l, tmp + l)))
+                    nv_src = nv
+                elif sel and level == 4:
+                    rk = _sel15_rank[g]
+                    t2a4 = TMP2A + (rk % 8) * VLEN
+                    if L4MAC:
+                        q2 = _q2[rk % len(_q2)] if _q2 else tmp
+                        nv_src = emit_l4_macsel(ua, nv, tmp, t2a4, idx, q2)
+                    else:
+                        # flow 形式（系数 vselect 链）：alu 组只花 1 条 valu MAC——cond 走 alu、
+                        # D/E 选择走 flow（选中的组跑在尾部前段，flow 尚有余量）
+                        nv_src = emit_node_select(ua, 4, nv, tmp, t2a4, nv, idx)
+                elif sel and level == 2 and TAILM and g >= ng - TAILM and r >= rounds - 3:
+                    # 末尾组晚轮的 2 级 L2（MAC 链）：P0/Q/cond 三者只依赖 idx、并行发射
+                    D0, E0 = pair_DE[(2, 0)]
+                    vmac(ua, nv, idx, D0, E0)                    # P0 = A·D0 + E0
+                    vmac(ua, tmp, idx, L2DD, L2EE)               # Q = A·ΔD + ΔE
+                    cmp_gt(ua, TAILMC, 4, idx)                   # c = (A ≥ fp+5)，专属 cond 区
+                    vmac(ua, nv, TAILMC, tmp, nv)                # nv = P0 + c·Q
+                    nv_src = nv
+                elif sel:
+                    nv_src = emit_node_select(ua, level, nv, tmp, t2a, t2b, idx)
                 else:
                     # idx 已是绝对地址 A → gather 直接 load(nv, idx)，免 addr-add
                     for lane in range(VLEN):
                         ops.append(("load", ("load", nv + lane, idx + lane)))
                     nv_src = nv
                 # val = myhash(val ^ node_val)（valu 组走向量，alu 组走标量分流）
-                vop(ua, "^", val, val, nv_src)
+                if not (L0FOLD and level == 0 and r > 0):
+                    vop(ua, "^", val, val, nv_src)   # L0FOLD：r11 的 F0-xor 已折进 r10 阶段5
+                # 末尾组的 B 形式 idx 更新（见 TAILB）：B 只读 idx，此刻就能算，借宿 xor 后
+                # 即空闲的 nv；下方 idx 更新缩为「&→add」两级
+                tb = (TAILB and g >= ng - TAILB and r != rounds - 1
+                      and level not in (0, forest_height)
+                      and g not in idxflow_groups and not is_spec(g, r + 1))
+                if tb:
+                    vmac(ua, nv, idx, TWO, CFP)                               # B = 2A + CFP
                 vmac(ua, val, val, K0, C0)                                    # 阶段0
                 vop(ua, ">>", tmp, val, S19)                                  # 阶段1
                 vop(ua, "^", val, val, C1)
                 vop(ua, "^", val, val, tmp)
+                vmac(ua, tmp, val, K3P, C2X)                                  # 阶段3：u 直读阶段1 输出（与阶段2 并行）
                 vmac(ua, val, val, K2, C2C3)                                  # 阶段2（常量折入阶段3 的 +C3）
-                vmac(ua, tmp, val, U512, UADD)                                # 阶段3：u = b'<<9 = b'*512 - C3*512
                 vop(ua, "^", val, val, tmp)                                   # result = b' ^ u
                 vmac(ua, val, val, K4, C4)                                    # 阶段4
                 vop(ua, ">>", tmp, val, S16)                                  # 阶段5
-                vop(ua, "^", val, val, C5)
+                _fold0 = L0FOLD and r + 1 < rounds and (r + 1) % period == 0
+                vop(ua, "^", val, val, C5F0 if _fold0 else C5)   # 下轮是 L0 → 常量并入 F0
                 vop(ua, "^", val, val, tmp)
                 # A(绝对地址)更新：newA = 2A + CFP + parity（CFP=1-forest_p）。三处省算子：
                 # ① 最后一轮 idx 不再用到 → 省；
@@ -366,7 +761,22 @@ class KernelBuilder:
                 # ③ L0 轮 idx 恒为 forest_p（常量）→ A = forest_p+1+parity = rvec(1)+parity，省掉 MAC。
                 if r != rounds - 1 and level != forest_height:
                     fl = g in idxflow_groups                                # +c 走 flow vselect
-                    if level == 0:
+                    if is_spec(g, r + 1):
+                        # 双子预取版 idx 更新：A0=2A+CFP 不等 parity 就能算（只读 idx），两个
+                        # 候选地址就地写进 nv/nv2 作 gather 地址缓冲（load 读旧地址写新值，
+                        # 程序序上 vselect 在前保证其读到的是地址）；idx 由 parity 选出。
+                        nv2 = spec_slot(g)
+                        vmac(ua, nv, idx, TWO, CFP)                          # A0 = 2A + CFP
+                        vop(ua, "+", nv2, nv, ONE)                           # A1 = A0 + 1
+                        vop(ua, "&", tmp, val, ONE)                          # parity（下一轮选值再用）
+                        ops.append(("flow", ("vselect", idx, tmp, nv2, nv)))
+                        _spec_pending[g] = (
+                            [("load", ("load", nv + lane, nv + lane)) for lane in range(VLEN)]
+                            + [("load", ("load", nv2 + lane, nv2 + lane)) for lane in range(VLEN)])
+                    elif tb:
+                        vop(ua, "&", tmp, val, ONE)                          # parity
+                        vop(ua, "+", idx, tmp, nv)                           # A = B + parity（B 已提前）
+                    elif level == 0:
                         vop(ua, "&", tmp, val, ONE)                          # parity
                         if fl:  # A = parity? rvec(2) : rvec(1)（省一次 valu/alu 加）
                             ops.append(("flow", ("vselect", idx, tmp, rvec(2), rvec(1))))
@@ -388,16 +798,57 @@ class KernelBuilder:
         #     且尾部不再是单组独占。末 TK 轮改 round-major：那几轮各组只剩独立单轮，drain 短，
         #     还能回填主体尾部的空槽。round-major 头部会触发同层 gather 聚集（load 突发）反而更慢，
         #     故头部不铺开。SK/TK 由扫参得最优（见 RESULTS「消 drain」一节）。
-        EMIT = os.environ.get("EMIT", "diagtail")
         if EMIT == "diagtail":
-            SK = int(os.environ.get("SKEW", "4"))
-            TK = int(os.environ.get("TAILK", "2"))
+            # 非均匀斜率：后段组（g ≥ TSG）用更小的斜率 TSK 提前起跑——末组的链端 ≈ 起跑+~230
+            # 拍串行链，压缩后段起跑能让链端向 load 的完成时间靠拢、缩短纯 drain。
+            TSG = int(os.environ.get("TSG", str(ng)))
+            TSK = int(os.environ.get("TSK", str(SK)))
+
+            def wkey(g):
+                return SK * g if g < TSG else SK * TSG + TSK * (g - TSG)
+
             body = sorted(((g, r) for g in range(ng) for r in range(rounds - TK)),
-                          key=lambda gr: (gr[1] + SK * gr[0], gr[0]))
-            order = body + [(g, r) for r in range(rounds - TK, rounds) for g in range(ng)]
+                          key=lambda gr: (gr[1] + wkey(gr[0]), gr[0]))
+            tgorder = list(range(ng))
+            tail15 = [(g, rounds - 1) for g in range(ng)]
+            if use_l4:
+                # 尾段各轮的组序都重排为「donor → 被转换组 → 其余」：尾段轮次按排放序在引擎
+                # frontier 上排队执行，被转换组的 r14/r15-select 必须排在前部才能被尾段吸收
+                # （否则其 select+hash 链 ~26 拍在队尾甩出新尾巴，实测 SEL15=6 时 +20）。
+                # r15 序中在 donor 之后注入系数广播（donor 的 tmp/nv 至此彻底死亡）。
+                # （试过把 donor 的 r14/r15 放回 body 对角线让广播更早就绪：donor 的 r15 gather
+                #   会在 load 流里插队、把中段组的 gather 全推后，反而 +13~+28，弃。）
+                _ds = set(_donors)
+                _cs = sorted(sel15_groups)
+                # TGPRI：尾段各轮「其余组」里让最末 TGPRI 个组排最前——它们是终链级联的头，
+                # 早拿到 valu/load 槽整条级联就整体左移（其余组的排放不受影响，谁最后完成
+                # 谁承担终链，但级联释放得越早、与 load 队列的重叠越满）。
+                TGPRI = int(os.environ.get("TGPRI", "0"))
+
+                def _others(exclude):
+                    rest = [g for g in range(ng) if g not in exclude]
+                    return rest[-TGPRI:][::-1] + rest[:-TGPRI] if TGPRI else rest
+
+                tgorder = _donors + _cs + _others(_ds | sel15_groups)
+                _a15s = sorted(sel15a_groups)
+                tail15 = ([(g, rounds - 1) for g in _donors] + [("L4BCAST", -1)] +
+                          [(g, rounds - 1) for g in _cs] +
+                          [(g, rounds - 1) for g in _a15s] +
+                          [(g, rounds - 1)
+                           for g in _others(_ds | sel15_groups | sel15a_groups)])
+            order = (body +
+                     [(g, r) for r in range(rounds - TK, rounds - 1) for g in tgorder] +
+                     tail15)
         else:  # group-major 回退
             order = [(g, r) for g in range(ng) for r in range(rounds)]
         for g, r in order:
+            if g == "L4BCAST":
+                for j in range(8):
+                    Dv, Ev = pair_DE[(4, j)]
+                    d_s, e_s = l4de[j]
+                    ops.append(("valu", ("vbroadcast", Dv, d_s)))
+                    ops.append(("valu", ("vbroadcast", Ev, e_s)))
+                continue
             emit_gr(g, r)
 
         # 写回 val（提交只校验 inp_values）。每组 store 归 region ("io", g)：各组写回地址不相交 →
@@ -406,9 +857,22 @@ class KernelBuilder:
         for g in range(ng):
             ops.append(("store", ("vstore", vbase[g], VAL + g * VLEN), ("io", g)))
 
-        ops.append(("flow", ("pause",)))  # 结束 pause（对齐 reference 的第二个 yield）
-
-        self.instrs = schedule(ops)
+        self._ops = ops  # 供 logix 工具（roofline/关键路径/调度诊断）直接取算子流
+        instrs = schedule(ops)
+        # 注入两条 pause（见 ops 开头的注释）：
+        # 起始 pause 放进第一个 flow 有空槽的 bundle（此前全是 setup，无内存写 → run1 的
+        # 检查读到的 inp_values 原封不动）；结束 pause 放进最后一个 bundle（store 同拍已提交）。
+        for b in instrs[:-1]:
+            if len(b.get("flow", [])) < 1:
+                b.setdefault("flow", []).append(("pause",))
+                break
+        else:
+            instrs.insert(0, {"flow": [("pause",)]})
+        if len(instrs[-1].get("flow", [])) < 1:
+            instrs[-1].setdefault("flow", []).append(("pause",))
+        else:
+            instrs.append({"flow": [("pause",)]})
+        self.instrs = instrs
 
 BASELINE = 147734
 
